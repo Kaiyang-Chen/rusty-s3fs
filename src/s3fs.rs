@@ -18,6 +18,9 @@ use std::os::unix::ffi::OsStrExt;
 use log::debug;
 use std::cmp::min;
 use std::os::unix::fs::FileExt;
+use crate::s3util::S3Worker;
+use tokio::runtime::Runtime;
+use time::OffsetDateTime;
 
 
 const BLOCK_SIZE: u64 = 512;
@@ -82,6 +85,7 @@ struct InodeAttributes {
     pub hardlinks: u32,
     pub uid: u32,
     pub gid: u32,
+    pub md5: String
 }
 
 impl From<InodeAttributes> for fuser::FileAttr {
@@ -115,17 +119,20 @@ pub(crate) struct S3FS {
     data_dir: String,
     next_file_handle: AtomicU64,
     direct_io: bool,
+    worker: S3Worker,
 }
 
 impl S3FS  {
     pub fn new(
         data_dir: String,
         direct_io: bool,
+        worker: S3Worker,
     ) -> S3FS {
         S3FS {
             data_dir,
             next_file_handle: AtomicU64::new(1),
             direct_io,
+            worker,
         }
     }
 
@@ -220,12 +227,59 @@ impl S3FS  {
         bincode::serialize_into(file, &entries).unwrap();
     }
 
-    fn lookup_name(&self, parent: u64, name: &OsStr) -> Result<InodeAttributes, c_int> {
+    fn  lookup_name(&self, parent: u64, name: &OsStr) -> Result<InodeAttributes, c_int> {
         let entries = self.get_directory_content(parent)?;
+        println!("{:?}", name);
         if let Some((inode, _)) = entries.get(name.as_bytes()) {
+            // TODO: check metadata of the file, if not consistent, update, otherwise, return
             return self.get_inode(*inode);
         } else {
-            return Err(libc::ENOENT);
+            let exists = Runtime::new().unwrap().block_on(self.worker.is_exist(name.to_str().unwrap())).unwrap();
+            if exists {
+                let inode = self.allocate_next_inode();
+                let metadata = Runtime::new().unwrap().block_on(self.worker.get_stats(name.to_str().unwrap())).unwrap();
+                let parent_attrs = self.get_inode(parent).unwrap();
+                let mut attrs = InodeAttributes {
+                    inode,
+                    open_file_handles: 1,
+                    size: 0,
+                    last_accessed: time_now(),
+                    last_modified: time_from_offsetdatatime(metadata.last_modified()),
+                    last_metadata_changed: time_now(),
+                    kind: FileKind::File,
+                    mode: 0o777,
+                    hardlinks: 1,
+                    uid: parent_attrs.uid,
+                    gid: parent_attrs.gid,
+                    // use dummy metadata here
+                    // md5: metadata.content_md5().unwrap().to_string(),
+                    md5: "".to_string(),
+                };
+                let path = self.content_path(inode);
+                File::create(&path).unwrap();
+                let data = Runtime::new().unwrap().block_on(self.worker.get_data(name.to_str().unwrap())).unwrap();
+                if let Ok(mut file) = OpenOptions::new().write(true).open(&path) {
+                    file.seek(SeekFrom::Start(0 as u64)).unwrap();
+                    file.write_all(&data).unwrap();
+
+                    attrs.last_metadata_changed = time_now();
+                    attrs.last_modified = time_now();
+                    if data.len() as usize > attrs.size as usize {
+                        attrs.size = (data.len() as usize) as u64;
+                    }
+                    clear_suid_sgid(&mut attrs);
+                    self.write_inode(&attrs);
+
+                    let mut entries = self.get_directory_content(parent).unwrap();
+                    entries.insert(name.as_bytes().to_vec(), (inode, attrs.kind));
+                    self.write_directory_content(parent, entries);
+                } 
+                
+
+                return self.get_inode(inode);
+            } else {
+                return Err(libc::ENOENT);
+            }  
         }
     }
 
@@ -273,6 +327,7 @@ impl Filesystem for S3FS {
                 hardlinks: 2,
                 uid: 0,
                 gid: 0,
+                md5: "".to_string(),
             };
             self.write_inode(&root);
             let mut entries = BTreeMap::new();
@@ -510,6 +565,8 @@ impl Filesystem for S3FS {
             hardlinks: 1,
             uid: req.uid(),
             gid: creation_gid(&parent_attrs, req.gid()),
+            // a dummy md5, will update after writting content to it
+            md5: "".to_string()
         };
         self.write_inode(&attrs);
         File::create(self.content_path(inode)).unwrap();
@@ -684,4 +741,12 @@ fn creation_gid(parent: &InodeAttributes, gid: u32) -> u32 {
     }
 
     gid
+}
+
+fn time_from_offsetdatatime(dt: Option<OffsetDateTime>) -> (i64, u32) {
+    dt.map(|dt| {
+        let timestamp_secs = dt.unix_timestamp();
+        let timestamp_millis = dt.millisecond();
+        (timestamp_secs, timestamp_millis as u32)
+    }).unwrap()
 }
