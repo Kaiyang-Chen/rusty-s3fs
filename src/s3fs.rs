@@ -21,6 +21,7 @@ use std::os::unix::fs::FileExt;
 use crate::s3util::S3Worker;
 use tokio::runtime::Runtime;
 use time::OffsetDateTime;
+use async_recursion::async_recursion;
 
 
 const BLOCK_SIZE: u64 = 512;
@@ -229,57 +230,58 @@ impl S3FS  {
 
     fn  lookup_name(&self, parent: u64, name: &OsStr) -> Result<InodeAttributes, c_int> {
         let entries = self.get_directory_content(parent)?;
-        println!("{:?}", name);
+        // println!("{:?}", name);
         if let Some((inode, _)) = entries.get(name.as_bytes()) {
             // TODO: check metadata of the file, if not consistent, update, otherwise, return
             return self.get_inode(*inode);
         } else {
-            let exists = Runtime::new().unwrap().block_on(self.worker.is_exist(name.to_str().unwrap())).unwrap();
-            if exists {
-                let inode = self.allocate_next_inode();
-                let metadata = Runtime::new().unwrap().block_on(self.worker.get_stats(name.to_str().unwrap())).unwrap();
-                let parent_attrs = self.get_inode(parent).unwrap();
-                let mut attrs = InodeAttributes {
-                    inode,
-                    open_file_handles: 1,
-                    size: 0,
-                    last_accessed: time_now(),
-                    last_modified: time_from_offsetdatatime(metadata.last_modified()),
-                    last_metadata_changed: time_now(),
-                    kind: FileKind::File,
-                    mode: 0o777,
-                    hardlinks: 1,
-                    uid: parent_attrs.uid,
-                    gid: parent_attrs.gid,
-                    // use dummy metadata here
-                    // md5: metadata.content_md5().unwrap().to_string(),
-                    md5: "".to_string(),
-                };
-                let path = self.content_path(inode);
-                File::create(&path).unwrap();
-                let data = Runtime::new().unwrap().block_on(self.worker.get_data(name.to_str().unwrap())).unwrap();
-                if let Ok(mut file) = OpenOptions::new().write(true).open(&path) {
-                    file.seek(SeekFrom::Start(0 as u64)).unwrap();
-                    file.write_all(&data).unwrap();
+            // let exists = Runtime::new().unwrap().block_on(self.worker.is_exist(name.to_str().unwrap())).unwrap();
+            // if exists {
+            //     let inode = self.allocate_next_inode();
+            //     let metadata = Runtime::new().unwrap().block_on(self.worker.get_stats(name.to_str().unwrap())).unwrap();
+            //     let parent_attrs = self.get_inode(parent).unwrap();
+            //     let mut attrs = InodeAttributes {
+            //         inode,
+            //         open_file_handles: 1,
+            //         size: 0,
+            //         last_accessed: time_now(),
+            //         last_modified: time_from_offsetdatatime(metadata.last_modified()),
+            //         last_metadata_changed: time_now(),
+            //         kind: FileKind::File,
+            //         mode: 0o777,
+            //         hardlinks: 1,
+            //         uid: parent_attrs.uid,
+            //         gid: parent_attrs.gid,
+            //         // use dummy metadata here
+            //         // md5: metadata.content_md5().unwrap().to_string(),
+            //         md5: "".to_string(),
+            //     };
+            //     let path = self.content_path(inode);
+            //     File::create(&path).unwrap();
+            //     let data = Runtime::new().unwrap().block_on(self.worker.get_data(name.to_str().unwrap())).unwrap();
+            //     if let Ok(mut file) = OpenOptions::new().write(true).open(&path) {
+            //         file.seek(SeekFrom::Start(0 as u64)).unwrap();
+            //         file.write_all(&data).unwrap();
 
-                    attrs.last_metadata_changed = time_now();
-                    attrs.last_modified = time_now();
-                    if data.len() as usize > attrs.size as usize {
-                        attrs.size = (data.len() as usize) as u64;
-                    }
-                    clear_suid_sgid(&mut attrs);
-                    self.write_inode(&attrs);
+            //         attrs.last_metadata_changed = time_now();
+            //         attrs.last_modified = time_now();
+            //         if data.len() as usize > attrs.size as usize {
+            //             attrs.size = (data.len() as usize) as u64;
+            //         }
+            //         clear_suid_sgid(&mut attrs);
+            //         self.write_inode(&attrs);
 
-                    let mut entries = self.get_directory_content(parent).unwrap();
-                    entries.insert(name.as_bytes().to_vec(), (inode, attrs.kind));
-                    self.write_directory_content(parent, entries);
-                } 
+            //         let mut entries = self.get_directory_content(parent).unwrap();
+            //         entries.insert(name.as_bytes().to_vec(), (inode, attrs.kind));
+            //         self.write_directory_content(parent, entries);
+            //     } 
                 
 
-                return self.get_inode(inode);
-            } else {
-                return Err(libc::ENOENT);
-            }  
+            //     return self.get_inode(inode);
+            // } else {
+            //     return Err(libc::ENOENT);
+            // }  
+            return Err(libc::ENOENT);
         }
     }
 
@@ -297,9 +299,91 @@ impl S3FS  {
             .join(inode.to_string())
     }
 
+    //  TODO: The function is only a toy at the moment that it does not support finding files in directories other than root. If want to find any file path with the inode, one might need to find a way to get its parent dir's inode for any path.
+    fn get_filename_from_inode(&self, inode: Inode) -> String {
+        let entries = self.get_directory_content(FUSE_ROOT_ID).unwrap();
+        let filename = get_key_by_value(&entries, &(inode, FileKind::File)).unwrap();
+        let s = String::from_utf8_lossy(filename);
+        s.to_string()
+    }
+
     fn creation_mode(&self, mode: u32) -> u16 {
         (mode & !(libc::S_ISUID | libc::S_ISGID) as u32) as u16
     }
+
+    #[async_recursion]
+    async fn init_directories(&self, path: &str, parent: Inode)  -> Result<(), Box<dyn std::error::Error>>{
+        print!("init dirs");
+        let entries = self.worker.list_dir(path).await?;
+        let mut parent_attrs =self.get_inode(parent).unwrap();
+        for file in entries {
+            println!("{:?}", file);
+            let full_path = format!("{}{}", path, file);
+            let is_file = self.worker.is_file(&full_path).await?;
+
+            if is_file {
+                println!("is file");
+                // let metadata =  self.worker.get_stats(full_path.as_str()).await?;
+                let file_inode = self.allocate_next_inode();
+                let attrs = InodeAttributes {
+                    inode: file_inode,
+                    open_file_handles: 1,
+                    size: 0,
+                    last_accessed: time_now(),
+                    // last_modified: time_from_offsetdatatime(metadata.last_modified()),
+                    last_modified: time_now(),
+                    last_metadata_changed: time_now(),
+                    kind: FileKind::File,
+                    mode: 0x777,
+                    hardlinks: 1,
+                    uid: parent_attrs.uid,
+                    gid: parent_attrs.gid,
+                    md5: "".to_string()
+                };
+                self.write_inode(&attrs);
+                let mut entries = self.get_directory_content(parent).unwrap();
+                entries.insert(file.as_bytes().to_vec(), (file_inode, attrs.kind));
+                self.write_directory_content(parent, entries);
+                
+                parent_attrs.last_modified = time_now();
+                parent_attrs.last_metadata_changed = time_now();
+                self.write_inode(&parent_attrs);
+            } else {
+                let dir_path = format!("{}/", full_path);
+                let dir_inode = self.allocate_next_inode();
+                let attrs = InodeAttributes {
+                    inode: dir_inode,
+                    open_file_handles: 1,
+                    size: 0,
+                    last_accessed: time_now(),
+                    last_modified: time_now(),
+                    last_metadata_changed: time_now(),
+                    kind: FileKind::Directory,
+                    mode: 0x777,
+                    hardlinks: 1,
+                    uid: parent_attrs.uid,
+                    gid: parent_attrs.gid,
+                    md5: "".to_string()
+                };
+                self.write_inode(&attrs);
+                let mut entries = BTreeMap::new();
+                entries.insert(b"..".to_vec(), (parent, FileKind::Directory));
+                entries.insert(b".".to_vec(), (dir_inode, FileKind::Directory));
+                self.write_directory_content(dir_inode, entries);
+
+                let mut parent_entries = self.get_directory_content(parent).unwrap();
+                let name = list_directory(dir_path.as_str()).unwrap();
+                parent_entries.insert(name.as_bytes().to_vec(), (dir_inode, FileKind::Directory));
+                self.write_directory_content(parent, parent_entries);
+                parent_attrs.last_modified = time_now();
+                parent_attrs.last_metadata_changed = time_now();
+                self.write_inode(&parent_attrs);
+                self.init_directories(&dir_path, dir_inode).await?;
+            }
+        }
+        Ok(())
+    }
+
 }
 
 
@@ -311,6 +395,7 @@ impl Filesystem for S3FS {
         _req: &Request,
         #[allow(unused_variables)] config: &mut KernelConfig,
     ) -> Result<(), c_int> {
+        println!("initializing");
         fs::create_dir_all(Path::new(&self.data_dir).join("inodes")).unwrap();
         fs::create_dir_all(Path::new(&self.data_dir).join("contents")).unwrap();
         if self.get_inode(FUSE_ROOT_ID).is_err() {
@@ -333,7 +418,11 @@ impl Filesystem for S3FS {
             let mut entries = BTreeMap::new();
             entries.insert(b".".to_vec(), (FUSE_ROOT_ID, FileKind::Directory));
             self.write_directory_content(FUSE_ROOT_ID, entries);
+            let rt = Runtime::new().unwrap();
+            rt.block_on(self.init_directories("", FUSE_ROOT_ID)).unwrap();
+            
         }
+        println!("finish initialization");
         Ok(())
     }
 
@@ -399,6 +488,55 @@ impl Filesystem for S3FS {
 
         match self.get_inode(inode) {
             Ok(mut attr) => {
+                // check whether the file is newest version, if not, write the newest version to local cache. initial md5 is set to empty string, so when open the file for the first time, it will load the file from the cloud.
+                let rt = Runtime::new().unwrap();
+                let filename = self.get_filename_from_inode(inode);
+                let metadata = rt.block_on(self.worker.get_stats(&filename)).unwrap();
+                // if metadata.content_md5().unwrap().to_string() != attr.md5 {
+                if time_from_offsetdatatime(metadata.last_modified()) != attr.last_modified {
+                    let path = self.content_path(inode);
+                    File::create(&path).unwrap();
+                    let data = rt.block_on(self.worker.get_data(&filename)).unwrap();
+                    if let Ok(mut file) = OpenOptions::new().write(true).open(&path) {
+                        // file.seek(SeekFrom::Start(0 as u64)).unwrap();
+                        // file.write_all(&data).unwrap();
+    
+                        // attr.last_modified = time_from_offsetdatatime(metadata.last_modified());
+                        // if data.len() as usize > attr.size as usize {
+                        //     attr.size = (data.len() as usize) as u64;
+                        // }
+                        // clear_suid_sgid(&mut attr);
+                        // self.write_inode(&attr);
+                        // print!("finish caching")
+                        // TODO: some flaws here, the last change time for parent dir is unmodified, but since the monified_time entry for dir is unused in our case, leave for future to solve.
+                        print!("start caching");
+                        io::stdout().flush().unwrap();
+
+                        if let Err(e) = file.seek(SeekFrom::Start(0 as u64)) {
+                            println!("Error seeking file: {:?}", e);
+                        }
+                        print!("seek completed");
+                        io::stdout().flush().unwrap();
+
+                        if let Err(e) = file.write_all(&data) {
+                            println!("Error writing data: {:?}", e);
+                        }
+                        print!("write completed");
+                        io::stdout().flush().unwrap();
+
+                        attr.last_modified = time_from_offsetdatatime(metadata.last_modified());
+                        if data.len() as usize > attr.size as usize {
+                            attr.size = (data.len() as usize) as u64;
+                        }
+                        clear_suid_sgid(&mut attr);
+                        self.write_inode(&attr);
+                        print!("inode updated");
+                        io::stdout().flush().unwrap();
+
+                        print!("finish caching");
+                        io::stdout().flush().unwrap();
+                    } 
+                }
                 if check_access(
                     attr.uid,
                     attr.gid,
@@ -412,6 +550,7 @@ impl Filesystem for S3FS {
                     let open_flags = if self.direct_io { FOPEN_DIRECT_IO } else { 0 };
                     reply.opened(self.allocate_next_file_handle(read, write), open_flags);
                 } else {
+                    print!("check access failed\n");
                     reply.error(libc::EACCES);
                 }
                 return;
@@ -439,6 +578,7 @@ impl Filesystem for S3FS {
             "read() called on {:?} offset={:?} size={:?}",
             inode, offset, size
         );
+        println!("read() called on {:?} offset={:?} size={:?}",inode, offset, size);
         assert!(offset >= 0);
         if !self.check_file_handle_read(fh) {
             reply.error(libc::EACCES);
@@ -446,6 +586,7 @@ impl Filesystem for S3FS {
         }
 
         let path = self.content_path(inode);
+        println!("{:?}", path);
         if let Ok(file) = File::open(&path) {
             let file_size = file.metadata().unwrap().len();
             // Could underflow if file length is less than local_start
@@ -453,6 +594,7 @@ impl Filesystem for S3FS {
 
             let mut buffer = vec![0; read_size as usize];
             file.read_exact_at(&mut buffer, offset as u64).unwrap();
+            println!("{:?}", &buffer);
             reply.data(&buffer);
         } else {
             reply.error(libc::ENOENT);
@@ -749,4 +891,18 @@ fn time_from_offsetdatatime(dt: Option<OffsetDateTime>) -> (i64, u32) {
         let timestamp_millis = dt.millisecond();
         (timestamp_secs, timestamp_millis as u32)
     }).unwrap()
+}
+
+fn list_directory(path: &str) -> Option<&str> {
+    let mut directories = path.split('/').filter(|s| !s.is_empty());
+    let last_directory = directories.next_back();
+    last_directory
+}
+
+fn get_key_by_value<'a, K, V>(map: &'a BTreeMap<K, V>, value: &V) -> Option<&'a K>
+where
+    K: Ord,
+    V: PartialEq,
+{
+    map.iter().find(|(_, v)| v == &value).map(|(k, _)| k)
 }
