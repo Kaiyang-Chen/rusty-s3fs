@@ -26,14 +26,12 @@ impl S3Worker {
     pub async fn is_exist(&self, path: &str) -> Result<bool, Box<dyn std::error::Error>> {
         let op = Operator::new(self.builder.clone())?.finish();
         let exist = op.is_exist(path).await?;
-        println!("{:?}", exist);
         Ok(exist)
     }
 
     pub async fn get_stats(&self, path: &str) -> Result<Metadata, Box<dyn std::error::Error>> {
         let op = Operator::new(self.builder.clone())?.finish();
         let metadata = op.stat(path).await?;
-        println!("{:?}", metadata);
         Ok(metadata)
     }
 
@@ -51,7 +49,6 @@ impl S3Worker {
     pub async fn get_data(&self, path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let op = Operator::new(self.builder.clone())?.finish();
         let data = op.read(path).await?;
-        println!("{:?}", data);
         Ok(data)
     }
 
