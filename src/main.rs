@@ -7,7 +7,7 @@ use std::io::ErrorKind;
 use fuser::MountOption;
 use log::error;
 use crate::s3fs::S3FS;
-use crate::s3util::S3Worker;
+use crate::s3util::GcsWorker;
 
 
 
@@ -84,7 +84,7 @@ fn main() {
         S3FS::new(
             data_dir,
             matches.is_present("direct-io"),
-            S3Worker::new(bucket)
+            GcsWorker::new(bucket)
         ),
         mountpoint,
         &options,

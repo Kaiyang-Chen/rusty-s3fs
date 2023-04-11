@@ -18,7 +18,7 @@ use std::os::unix::ffi::OsStrExt;
 use log::debug;
 use std::cmp::min;
 use std::os::unix::fs::FileExt;
-use crate::s3util::S3Worker;
+use crate::s3util::GcsWorker;
 use tokio::runtime::Runtime;
 use time::OffsetDateTime;
 use async_recursion::async_recursion;
@@ -120,14 +120,14 @@ pub(crate) struct S3FS {
     data_dir: String,
     next_file_handle: AtomicU64,
     direct_io: bool,
-    worker: S3Worker,
+    worker: GcsWorker,
 }
 
 impl S3FS  {
     pub fn new(
         data_dir: String,
         direct_io: bool,
-        worker: S3Worker,
+        worker: GcsWorker,
     ) -> S3FS {
         S3FS {
             data_dir,
@@ -513,6 +513,7 @@ impl Filesystem for S3FS {
                     if let Ok(mut file) = OpenOptions::new().write(true).open(&path) {
                         file.seek(SeekFrom::Start(0 as u64)).unwrap();
                         file.write_all(&data).unwrap();
+                        attr.md5 = metadata.content_md5().unwrap().to_string();
                         attr.last_metadata_changed = time_now();
                         attr.last_modified = time_from_offsetdatatime(metadata.last_modified());
                         if data.len() as usize > attr.size as usize {
@@ -520,7 +521,6 @@ impl Filesystem for S3FS {
                         }
                         clear_suid_sgid(&mut attr);
                         self.write_inode(&attr);
-                        // TODO: some flaws here, the last change time for parent dir is unmodified, but since the monified_time entry for dir is unused in our case, leave for future to solve.
                     } 
                 }
                 if check_access(
