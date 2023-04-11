@@ -8,7 +8,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Seek, Write, SeekFrom};
 use fuser::{
     Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    Request, KernelConfig, FUSE_ROOT_ID, ReplyOpen, ReplyWrite, ReplyCreate
+    Request, KernelConfig, FUSE_ROOT_ID, ReplyOpen, ReplyWrite, ReplyCreate, ReplyEmpty
 };
 use fuser::consts::FOPEN_DIRECT_IO;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -378,6 +378,25 @@ impl S3FS  {
             }
         }
         Ok(())
+    }
+
+    // Check whether a file should be removed from storage. Should be called after decrementing
+    // the link count, or closing a file handle
+    fn gc_inode(&self, inode: &InodeAttributes) -> bool {
+        if inode.hardlinks == 0 && inode.open_file_handles == 0 {
+            let inode_path = Path::new(&self.data_dir)
+                .join("inodes")
+                .join(inode.inode.to_string());
+            fs::remove_file(inode_path).unwrap();
+            let content_path = Path::new(&self.data_dir)
+                .join("contents")
+                .join(inode.inode.to_string());
+            fs::remove_file(content_path).unwrap();
+
+            return true;
+        }
+
+        return false;
     }
 
 }
@@ -779,6 +798,63 @@ impl Filesystem for S3FS {
         reply.ok();
     }
 
+
+    fn unlink(&mut self, req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        debug!("unlink() called with {:?} {:?}", parent, name);
+        let mut attrs = match self.lookup_name(parent, name) {
+            Ok(attrs) => attrs,
+            Err(error_code) => {
+                reply.error(error_code);
+                return;
+            }
+        };
+
+        let mut parent_attrs = match self.get_inode(parent) {
+            Ok(attrs) => attrs,
+            Err(error_code) => {
+                reply.error(error_code);
+                return;
+            }
+        };
+
+        if !check_access(
+            parent_attrs.uid,
+            parent_attrs.gid,
+            parent_attrs.mode,
+            req.uid(),
+            req.gid(),
+            libc::W_OK,
+        ) {
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        let uid = req.uid();
+        // "Sticky bit" handling
+        if parent_attrs.mode & libc::S_ISVTX as u16 != 0
+            && uid != 0
+            && uid != parent_attrs.uid
+            && uid != attrs.uid
+        {
+            reply.error(libc::EACCES);
+            return;
+        }
+
+        parent_attrs.last_metadata_changed = time_now();
+        parent_attrs.last_modified = time_now();
+        self.write_inode(&parent_attrs);
+
+        attrs.hardlinks -= 1;
+        attrs.last_metadata_changed = time_now();
+        self.write_inode(&attrs);
+        self.gc_inode(&attrs);
+
+        let mut entries = self.get_directory_content(parent).unwrap();
+        entries.remove(name.as_bytes());
+        self.write_directory_content(parent, entries);
+
+        reply.ok();
+    }
 
 
 
