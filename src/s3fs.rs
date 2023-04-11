@@ -18,7 +18,7 @@ use std::os::unix::ffi::OsStrExt;
 use log::debug;
 use std::cmp::min;
 use std::os::unix::fs::FileExt;
-use crate::s3util::S3Worker;
+use crate::s3util::GcsWorker;
 use tokio::runtime::Runtime;
 use time::OffsetDateTime;
 use async_recursion::async_recursion;
@@ -120,14 +120,14 @@ pub(crate) struct S3FS {
     data_dir: String,
     next_file_handle: AtomicU64,
     direct_io: bool,
-    worker: S3Worker,
+    worker: GcsWorker,
 }
 
 impl S3FS  {
     pub fn new(
         data_dir: String,
         direct_io: bool,
-        worker: S3Worker,
+        worker: GcsWorker,
     ) -> S3FS {
         S3FS {
             data_dir,

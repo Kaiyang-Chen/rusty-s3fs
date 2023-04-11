@@ -1,23 +1,23 @@
 use opendal::Operator;
-use opendal::services::S3;
+use opendal::services::Gcs;
 use opendal::Metadata;
 use futures::TryStreamExt;
 
-pub(crate) struct S3Worker {
+pub(crate) struct GcsWorker {
     bucket: String,
-    builder: S3,
+    builder: Gcs,
 }
 
-impl S3Worker {
+impl GcsWorker {
     pub fn new(
         bucket: String,
-    ) -> S3Worker {
-        let mut builder = S3::default();
+    ) -> GcsWorker {
+        let mut builder = Gcs::default();
         builder.bucket(bucket.as_str());
-        builder.endpoint("http://127.0.0.1:9000");
-        builder.access_key_id("admin");
-        builder.secret_access_key("password");
-        S3Worker {
+        // builder.endpoint("http://127.0.0.1:9000");
+        // builder.access_key_id("admin");
+        // builder.secret_access_key("password");
+        GcsWorker {
             bucket,
             builder,
         }
