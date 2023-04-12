@@ -68,7 +68,7 @@ Last, run it with
 
 ```
 ./target/debug/rusty-s3fs 
-		--mount-point MOUNT_POINT
+    --mount-point MOUNT_POINT
     --bucket-name BUCKET_NAME
     --data-dir CACHE_DATA_DIRECTORY
     --auto_unmount 
