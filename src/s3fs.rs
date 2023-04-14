@@ -508,20 +508,18 @@ impl Filesystem for S3FS {
                 // if metadata.content_md5().unwrap().to_string() != attr.md5 {
                 if time_from_offsetdatatime(metadata.last_modified()) != attr.last_modified {
                     let path = self.content_path(inode);
-                    File::create(&path).unwrap();
-                    let data = rt.block_on(self.worker.get_data(&filename)).unwrap();
-                    if let Ok(mut file) = OpenOptions::new().write(true).open(&path) {
-                        file.seek(SeekFrom::Start(0 as u64)).unwrap();
-                        file.write_all(&data).unwrap();
-                        attr.md5 = metadata.content_md5().unwrap().to_string();
-                        attr.last_metadata_changed = time_now();
-                        attr.last_modified = time_from_offsetdatatime(metadata.last_modified());
-                        if data.len() as usize > attr.size as usize {
-                            attr.size = (data.len() as usize) as u64;
+                    match rt.block_on(self.worker.get_data(filename.as_str(), path.to_str().unwrap())) {
+                        Ok(total_bytes_read) => {
+                            println!("Downloaded {} bytes", total_bytes_read);
+                            attr.md5 = metadata.content_md5().unwrap().to_string();
+                            attr.last_metadata_changed = time_now();
+                            attr.last_modified = time_from_offsetdatatime(metadata.last_modified());
+                            attr.size = total_bytes_read;
+                            clear_suid_sgid(&mut attr);
+                            self.write_inode(&attr);
                         }
-                        clear_suid_sgid(&mut attr);
-                        self.write_inode(&attr);
-                    } 
+                        Err(e) => println!("Error: {}", e),
+                    }
                 }
                 if check_access(
                     attr.uid,
