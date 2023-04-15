@@ -19,3 +19,4 @@ time = "0.3.0"
 futures = "0.3"
 async-recursion = "1.0.4"
 anyhow = { version = "1.0", default-features = false }
+rayon = "1.5"

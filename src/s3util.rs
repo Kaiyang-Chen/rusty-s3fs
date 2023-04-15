@@ -2,15 +2,16 @@ use opendal::Operator;
 use opendal::services::Gcs;
 use opendal::Metadata;
 use futures::TryStreamExt;
+use std::sync::Arc;
 // use std::task::{Context, Poll};
 // use futures::future::poll_fn;
 // use opendal::raw::oio::Read;
 // use std::ops::RangeBounds;
 // use std::error::Error;
-use anyhow::Error;
-use tokio::fs::{File, OpenOptions};
+use tokio::sync::{Mutex, Semaphore};
+use tokio::fs::File;
 use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
-use tokio::task::JoinHandle;
+use tokio::task;
 // use tokio::runtime::Runtime;
 
 pub(crate) struct GcsWorker {
@@ -117,43 +118,45 @@ impl GcsWorker {
         let size = metadata.content_length();
 
         // Create and initialize the file
-        let mut file = File::create(local_file_path).await?;
+        let file = File::create(local_file_path).await?;
         file.set_len(size).await?;
+        let file_mutex = Arc::new(Mutex::new(file));
+        let block_size = 512 * 1024 * 1024;
+        let num_blocks = (size as f64 / block_size as f64).ceil() as usize;
+        let num_threads = 4;
+        let semaphore = Arc::new(Semaphore::new(num_threads));
+        let mut tasks = Vec::with_capacity(num_blocks);
 
-        // Calculate the block size
-        let block_size: u64 = 256 * 1024 * 1024;
-        let num_threads = (size as f64 / block_size as f64).ceil() as usize;
-
-        // Spawn multiple tasks to read and write different data blocks
-        let mut tasks: Vec<JoinHandle<Result<(), Error>>> = Vec::new();
-        
-        for i in 0..num_threads {
-            let mut file_clone = file.try_clone().await?;
+        for i in 0..num_blocks {
+            let file_clone = Arc::clone(&file_mutex);
             let path_clone = path.to_owned();
             let start = block_size * i as u64;
             let end = std::cmp::min(start + block_size, size);
             let range = start..end;
-            let op_clone = op.clone();
+            let op = Operator::new(self.builder.clone())?.finish();
+            let semaphore_clone = Arc::clone(&semaphore);
 
-            let task = tokio::spawn(async move {
-                let data = op_clone.range_read(&path_clone, range).await?;
+            let task = task::spawn(async move {
+                let _permit = semaphore_clone.acquire().await;
+
+                let data = op.range_read(&path_clone, range).await?;
+                let mut file_clone = file_clone.lock().await;
                 file_clone.seek(SeekFrom::Start(start)).await?;
                 file_clone.write_all(&data).await?;
-                Ok(())
+
+                Ok::<(), anyhow::Error>(())
             });
+
             tasks.push(task);
         }
-    
-        // Wait for all tasks to complete
+
         let mut total_bytes_read: u64 = 0;
-        for task in tasks {
-            match task.await {
-                Ok(Ok(_)) => total_bytes_read += block_size,
-                Ok(Err(e)) => return Err(e),
-                Err(e) => return Err(Error::new(e)),
+        for result in futures::future::join_all(tasks).await {
+            match result {
+                Ok(_) => total_bytes_read += block_size,
+                Err(e) => return Err(e.into()),
             }
         }
-
         // Return the total bytes read
         Ok(total_bytes_read)
     }
