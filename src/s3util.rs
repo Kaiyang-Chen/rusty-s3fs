@@ -121,25 +121,25 @@ impl GcsWorker {
         let file = File::create(local_file_path).await?;
         file.set_len(size).await?;
         let file_mutex = Arc::new(Mutex::new(file));
-        let block_size = 512 * 1024 * 1024;
+        let block_size = 64 * 1024 * 1024;
         let num_blocks = (size as f64 / block_size as f64).ceil() as usize;
         let num_threads = 4;
         let semaphore = Arc::new(Semaphore::new(num_threads));
         let mut tasks = Vec::with_capacity(num_blocks);
-
+        let builder_clone = self.builder.clone();
         for i in 0..num_blocks {
-            let file_clone = Arc::clone(&file_mutex);
-            let path_clone = path.to_owned();
             let start = block_size * i as u64;
             let end = std::cmp::min(start + block_size, size);
             let range = start..end;
-            let op = Operator::new(self.builder.clone())?.finish();
             let semaphore_clone = Arc::clone(&semaphore);
-
+            let path_clone = path.to_owned();
+            let file_clone = Arc::clone(&file_mutex);
+            let builder_clone = builder_clone.clone();
             let task = task::spawn(async move {
                 let _permit = semaphore_clone.acquire().await;
+                let op_c = Operator::new(builder_clone)?.finish();
 
-                let data = op.range_read(&path_clone, range).await?;
+                let data = op_c.range_read(&path_clone, range).await?;
                 let mut file_clone = file_clone.lock().await;
                 file_clone.seek(SeekFrom::Start(start)).await?;
                 file_clone.write_all(&data).await?;
