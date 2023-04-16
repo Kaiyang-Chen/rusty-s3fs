@@ -19,7 +19,7 @@ fn main() {
             Arg::new("data-dir")
                 .long("data-dir")
                 .value_name("DIR")
-                .default_value("/tmp/fuser")
+                .default_value("/mnt/disks/nvme0/fuser")
                 .help("Set local directory used to store data")
                 .takes_value(true),
         )

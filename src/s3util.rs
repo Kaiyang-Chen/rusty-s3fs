@@ -56,62 +56,13 @@ impl GcsWorker {
         }
         
     }
-
-    // pub async fn get_data(&self, path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    //     let op = Operator::new(self.builder.clone())?.finish();
-    
-    //     // Get the metadata and file size
-    //     let metadata = op.stat(path).await?;
-    //     let size = metadata.content_length();
-    
-    //     // Create a buffer to hold the data in memory temporarily
-    //     let mut data = Vec::new();
-    
-    //     // Define the read block size
-    //     let block_size: usize = 512 * 1024 * 1024;
-    
-    //     // Create a buffer outside the loop to increase efficiency
-    //     let mut buffer = vec![0; block_size];
-    
-    //     // Read the remote file in chunks using range_reader
-    //     for offset in (0..size).step_by(block_size) {
-    //         let end = std::cmp::min(offset + block_size as u64, size);
-    
-    //         // Read a range of data from the remote file
-    //         let mut range_reader = op.range_reader(path, offset..end).await?;
-    
-    //         // Resize the buffer if the last chunk is smaller than the block size
-    //         if end - offset < block_size as u64 {
-    //             buffer.resize((end - offset) as usize, 0);
-    //         }
-    
-    //         // Read the data from the range reader into the buffer using poll_read
-    //         let mut bytes_read = 0;
-    //         while bytes_read < buffer.len() {
-    //             let poll_result = poll_fn(|cx: &mut Context<'_>| range_reader.poll_read(cx, &mut buffer[bytes_read..])).await;
-    //             match poll_result {
-    //                 Ok(n) => {
-    //                     if n == 0 {
-    //                         break;
-    //                     }
-    //                     bytes_read += n;
-    //                 }
-    //                 Err(e) => return Err(Box::new(e))
-    //             }
-    //         }
-    
-    //         // Append the read data to the `data` Vec
-    //         data.extend_from_slice(&buffer[0..bytes_read]);
-    //     }
-    
-    //     Ok(data)
-    // }    
     
 
     pub async fn get_data(
         &self,
         path: &str,
         local_file_path: &str,
+        num_threads: usize,
     ) -> Result<u64, anyhow::Error> {
         let op = Operator::new(self.builder.clone())?.finish();
         let metadata = op.stat(path).await?;
@@ -123,7 +74,6 @@ impl GcsWorker {
         let file_mutex = Arc::new(Mutex::new(file));
         let block_size = 64 * 1024 * 1024;
         let num_blocks = (size as f64 / block_size as f64).ceil() as usize;
-        let num_threads = 4;
         let semaphore = Arc::new(Semaphore::new(num_threads));
         let mut tasks = Vec::with_capacity(num_blocks);
         let builder_clone = self.builder.clone();
@@ -138,13 +88,30 @@ impl GcsWorker {
             let task = task::spawn(async move {
                 let _permit = semaphore_clone.acquire().await;
                 let op_c = Operator::new(builder_clone)?.finish();
-
+                
+                let range_read_start = std::time::Instant::now();
                 let data = op_c.range_read(&path_clone, range).await?;
+                let range_read_duration = range_read_start.elapsed();
+                println!(
+                    "Block {}: range_read() completed in {:?}",
+                    i, range_read_duration
+                );
+
+                let lock_acquire_start = std::time::Instant::now();
                 let mut file_clone = file_clone.lock().await;
+                let lock_acquire_duration = lock_acquire_start.elapsed();
+                println!(
+                    "Block {}: file lock acquired in {:?}",
+                    i, lock_acquire_duration
+                );
+
+                let write_start = std::time::Instant::now();
                 file_clone.seek(SeekFrom::Start(start)).await?;
                 file_clone.write_all(&data).await?;
+                let write_duration = write_start.elapsed();
+                println!("Block {}: file write completed in {:?}", i, write_duration);
 
-                Ok::<(), anyhow::Error>(())
+                Ok::<u64, anyhow::Error>(end-start)
             });
 
             tasks.push(task);
@@ -153,7 +120,7 @@ impl GcsWorker {
         let mut total_bytes_read: u64 = 0;
         for result in futures::future::join_all(tasks).await {
             match result {
-                Ok(_) => total_bytes_read += block_size,
+                Ok(bytes_read) => total_bytes_read += bytes_read.unwrap(),
                 Err(e) => return Err(e.into()),
             }
         }
