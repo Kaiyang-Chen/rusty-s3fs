@@ -10,9 +10,37 @@ use std::sync::Arc;
 // use std::error::Error;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::fs::File;
-use tokio::io::{AsyncSeekExt, AsyncWriteExt, SeekFrom};
+use tokio::io::{BufReader, AsyncSeekExt, copy_buf, SeekFrom, AsyncRead,AsyncBufReadExt};
 use tokio::task;
 // use tokio::runtime::Runtime;
+
+// A custom AsyncWrite implementation that allows concurrent writes to different positions.
+pub struct ConcurrentFile {
+    file: Arc<Mutex<tokio::fs::File>>,
+}
+
+impl ConcurrentFile {
+    pub async fn new(file: tokio::fs::File) -> Self {
+        Self {
+            file: Arc::new(Mutex::new(file)),
+        }
+    }
+
+    pub async fn write_at<R: AsyncRead + Unpin + tokio::io::AsyncBufRead>(
+        &self,
+        mut reader: R,
+        pos: u64,
+    ) -> Result<u64, std::io::Error> {
+        let mut file = self.file.lock().await;
+        file.seek(SeekFrom::Start(pos)).await?;
+
+        let bytes_written = copy_buf(&mut reader, &mut *file).await?;
+        Ok(bytes_written)
+    }
+}
+
+
+
 
 pub(crate) struct GcsWorker {
     bucket: String,
@@ -56,62 +84,13 @@ impl GcsWorker {
         }
         
     }
-
-    // pub async fn get_data(&self, path: &str) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-    //     let op = Operator::new(self.builder.clone())?.finish();
-    
-    //     // Get the metadata and file size
-    //     let metadata = op.stat(path).await?;
-    //     let size = metadata.content_length();
-    
-    //     // Create a buffer to hold the data in memory temporarily
-    //     let mut data = Vec::new();
-    
-    //     // Define the read block size
-    //     let block_size: usize = 512 * 1024 * 1024;
-    
-    //     // Create a buffer outside the loop to increase efficiency
-    //     let mut buffer = vec![0; block_size];
-    
-    //     // Read the remote file in chunks using range_reader
-    //     for offset in (0..size).step_by(block_size) {
-    //         let end = std::cmp::min(offset + block_size as u64, size);
-    
-    //         // Read a range of data from the remote file
-    //         let mut range_reader = op.range_reader(path, offset..end).await?;
-    
-    //         // Resize the buffer if the last chunk is smaller than the block size
-    //         if end - offset < block_size as u64 {
-    //             buffer.resize((end - offset) as usize, 0);
-    //         }
-    
-    //         // Read the data from the range reader into the buffer using poll_read
-    //         let mut bytes_read = 0;
-    //         while bytes_read < buffer.len() {
-    //             let poll_result = poll_fn(|cx: &mut Context<'_>| range_reader.poll_read(cx, &mut buffer[bytes_read..])).await;
-    //             match poll_result {
-    //                 Ok(n) => {
-    //                     if n == 0 {
-    //                         break;
-    //                     }
-    //                     bytes_read += n;
-    //                 }
-    //                 Err(e) => return Err(Box::new(e))
-    //             }
-    //         }
-    
-    //         // Append the read data to the `data` Vec
-    //         data.extend_from_slice(&buffer[0..bytes_read]);
-    //     }
-    
-    //     Ok(data)
-    // }    
     
 
     pub async fn get_data(
         &self,
         path: &str,
         local_file_path: &str,
+        num_threads: usize,
     ) -> Result<u64, anyhow::Error> {
         let op = Operator::new(self.builder.clone())?.finish();
         let metadata = op.stat(path).await?;
@@ -120,10 +99,9 @@ impl GcsWorker {
         // Create and initialize the file
         let file = File::create(local_file_path).await?;
         file.set_len(size).await?;
-        let file_mutex = Arc::new(Mutex::new(file));
+        let concurrent_file = Arc::new(ConcurrentFile::new(file).await);
         let block_size = 64 * 1024 * 1024;
         let num_blocks = (size as f64 / block_size as f64).ceil() as usize;
-        let num_threads = 4;
         let semaphore = Arc::new(Semaphore::new(num_threads));
         let mut tasks = Vec::with_capacity(num_blocks);
         let builder_clone = self.builder.clone();
@@ -133,32 +111,32 @@ impl GcsWorker {
             let range = start..end;
             let semaphore_clone = Arc::clone(&semaphore);
             let path_clone = path.to_owned();
-            let file_clone = Arc::clone(&file_mutex);
             let builder_clone = builder_clone.clone();
+            let concurrent_file_clone = Arc::clone(&concurrent_file);
+
             let task = task::spawn(async move {
                 let _permit = semaphore_clone.acquire().await;
                 let op_c = Operator::new(builder_clone)?.finish();
-
-                let data = op_c.range_read(&path_clone, range).await?;
-                let mut file_clone = file_clone.lock().await;
-                file_clone.seek(SeekFrom::Start(start)).await?;
-                file_clone.write_all(&data).await?;
-
-                Ok::<(), anyhow::Error>(())
+        
+                let mut reader = op_c.range_reader(&path_clone, range).await?;
+                let reader = BufReader::new(reader);
+                let bytes_written = concurrent_file_clone.write_at(reader, start).await?;
+        
+                Ok::<u64, anyhow::Error>(bytes_written)
             });
 
             tasks.push(task);
         }
 
-        let mut total_bytes_read: u64 = 0;
+        let mut total_bytes_written: u64 = 0;
         for result in futures::future::join_all(tasks).await {
             match result {
-                Ok(_) => total_bytes_read += block_size,
+                Ok(bytes_written) => total_bytes_written += bytes_written.unwrap(),
                 Err(e) => return Err(e.into()),
             }
         }
-        // Return the total bytes read
-        Ok(total_bytes_read)
+        // Return the total bytes written
+        Ok(total_bytes_written)
     }
 
 

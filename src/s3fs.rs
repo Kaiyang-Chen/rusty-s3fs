@@ -502,9 +502,9 @@ impl Filesystem for S3FS {
         match self.get_inode(inode) {
             Ok(mut attr) => {
                 // check whether the file is newest version, if not, write the newest version to local cache. initial md5 is set to empty string, so when open the file for the first time, it will load the file from the cloud.
-                // let rt = Runtime::new().unwrap();
+                let num_threads = 4;
                 let rt = tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(4) // Specify the number of worker threads
+                    .worker_threads(num_threads) // Specify the number of worker threads
                     .enable_all()
                     .build()
                     .unwrap();
@@ -513,7 +513,7 @@ impl Filesystem for S3FS {
                 // if metadata.content_md5().unwrap().to_string() != attr.md5 {
                 if time_from_offsetdatatime(metadata.last_modified()) != attr.last_modified {
                     let path = self.content_path(inode);
-                    match rt.block_on(self.worker.get_data(filename.as_str(), path.to_str().unwrap())) {
+                    match rt.block_on(self.worker.get_data(filename.as_str(), path.to_str().unwrap(), num_threads)) {
                         Ok(total_bytes_read) => {
                             println!("Downloaded {} bytes", total_bytes_read);
                             attr.md5 = metadata.content_md5().unwrap().to_string();
